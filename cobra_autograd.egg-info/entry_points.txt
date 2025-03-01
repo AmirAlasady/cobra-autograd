@@ -1,0 +1,2 @@
+[console_scripts]
+cobra-check = cobra_autograd.cli:check_installation
