@@ -115,9 +115,23 @@ class Tensor:
             out._prev = {self, index}
             def _backward():
                 if self.requires_grad:
+                    # Create zero-initialized gradient tensor
                     grad = self.xp.zeros_like(self.data)
-                    self.xp.put_along_axis(grad, index.data, out.grad.data, axis=dim)
-                    self.grad.data += grad
+                    
+                    # Create indices for all dimensions
+                    indices = list(self.xp.indices(index.data.shape))
+                    
+                    # Replace target dimension with index values
+                    indices[dim] = index.data
+                    
+                    # Assign gradients using advanced indexing
+                    grad[tuple(indices)] = out.grad.data
+                    
+                    # Accumulate gradients
+                    if self.grad is None:
+                        self.grad = Tensor(grad, dtype=self.dtype, device=self.device)
+                    else:
+                        self.grad.data += grad
             out._backward = _backward
 
         return out
