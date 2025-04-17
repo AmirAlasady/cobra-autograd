@@ -82,6 +82,10 @@ class Tensor:
         )
     def __getitem__(self, indices):
         """Enable slicing/indexing of tensor data"""
+        if isinstance(indices, Tensor):
+            if indices.device != self.device:
+                indices = indices.to(self.device)
+            indices = indices.data
         out_data = self.data[indices]
         out = Tensor(out_data,
                     device=self.device,
@@ -395,9 +399,13 @@ class Tensor:
         return out
 
     def __mul__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(other, device=self.device,
-                    dtype=self.dtype,#remove this if needed
-                    )
+        
+        if isinstance(other, Tensor): 
+            other.device = self.device
+            other.dtype = self.dtype
+        else:
+            other=Tensor(other, device=self.device,dtype=self.dtype)
+
         assert self.device == other.device, "Devices must match"
 
         out_data = self.data * other.data
@@ -415,7 +423,8 @@ class Tensor:
                 other.grad.data += unbroadcast_grad(self.data * out.grad.data, other.shape, xp)
         out._backward = _backward
         return out
-
+    
+    """ old code
     def __matmul__(self, other):
         other = other if isinstance(other, Tensor) else Tensor(other, device=self.device,
                     dtype=self.dtype,#remove this if needed
@@ -423,6 +432,8 @@ class Tensor:
         assert self.device == other.device, "Devices must match"
 
         out_data = self.data @ other.data
+        #  ---- or use out_data = xp.matmul(self.data, other.data) for clearaty ----
+
         out = Tensor(out_data, device=self.device, requires_grad=(self.requires_grad or other.requires_grad),
                     dtype=self.dtype,#remove this if needed
                     )
@@ -437,7 +448,32 @@ class Tensor:
                 other.grad.data += xp.matmul(self.data.T, out.grad.data)
         out._backward = _backward
         return out
+    """
+    # new code with batch dimension
+    def __matmul__(self, other):
+        other = other if isinstance(other, Tensor) else Tensor(other, device=self.device, dtype=self.dtype)
+        assert self.device == other.device, "Devices must match"
 
+        out_data = self.data @ other.data
+        out = Tensor(out_data, device=self.device, requires_grad=(self.requires_grad or other.requires_grad),
+                    dtype=self.dtype)
+        out._prev = {self, other}
+        out._op = 'matmul'
+
+        def _backward():
+            xp = out.xp
+            # Handle batch dimensions by summing over batch axis
+            if self.requires_grad:
+                grad_self = xp.einsum('...ij,...kj->...ik', out.grad.data, other.data)
+                self.grad.data += grad_self.sum(axis=tuple(range(grad_self.ndim - 2)))
+                
+            if other.requires_grad:
+                grad_other = xp.einsum('...ki,...kj->...ij', self.data, out.grad.data)
+                other.grad.data += grad_other.sum(axis=tuple(range(grad_other.ndim - 2)))
+
+        out._backward = _backward
+        return out
+    
     def square(self):
         """Element-wise square operation"""
         return self ** 2  # Leverage existing __pow__ method
@@ -481,12 +517,69 @@ class Tensor:
 
       return out
 
-
+    """ old code
     def mean(self, axis=None):
         num_elements = np.prod(self.data.shape) if axis is None else self.data.shape[axis]
         denom = self.xp.array(num_elements, dtype=self.dtype)
         return self.sum(axis=axis) / float(denom)
+    """
+    def mean(self, axis=None, keepdims=False):
+        """Compute mean with axis support"""
+        out_data = self.xp.mean(self.data, axis=axis, keepdims=keepdims)
+        out = Tensor(out_data, 
+                    device=self.device,
+                    dtype=self.dtype,
+                    requires_grad=self.requires_grad)
 
+        if self.requires_grad:
+            out._prev = {self}
+            def _backward():
+                if axis is None:
+                    grad = self.xp.ones_like(self.data) * out.grad.data / self.data.size
+                else:
+                    if keepdims:
+                        grad = out.grad.data / self.data.shape[axis]
+                    else:
+                        grad = self.xp.expand_dims(out.grad.data, axis=axis) / self.data.shape[axis]
+                    grad = self.xp.broadcast_to(grad, self.data.shape)
+                self.grad.data += grad
+            out._backward = _backward
+            
+        return out
+# --
+    def var(self, axis=None, keepdims=False, unbiased=True):
+        """Compute variance with axis support"""
+        mean = self.mean(axis=axis, keepdims=True)
+        squared_diff = (self - mean).square()
+        ddof = 1 if unbiased else 0
+        if axis is None:
+            n = self.data.size
+        else:
+            n = self.data.shape[axis]
+        out_data = squared_diff.data.mean(axis=axis, keepdims=keepdims) * n / (n - ddof)
+        
+        out = Tensor(out_data,
+                    device=self.device,
+                    dtype=self.dtype,
+                    requires_grad=self.requires_grad)
+
+        if self.requires_grad:
+            out._prev = {self}
+            def _backward():
+                # Gradient of variance calculation
+                grad = (2 / (n - ddof)) * (self.data - mean.data) * out.grad.data
+                if axis is not None and not keepdims:
+                    grad = self.xp.expand_dims(grad, axis=axis)
+                grad = self.xp.broadcast_to(grad, self.data.shape)
+                self.grad.data += grad
+            out._backward = _backward
+            
+        return out
+# --
+    def sqrt(self):
+        """Element-wise square root"""
+        return self ** 0.5
+    
     def __truediv__(self, other):
         xp = self.xp
         eps_val = 1e-8 if self.dtype == np.float32 else 1e-16
@@ -686,17 +779,15 @@ class Tensor:
 
     ### conv ###
     def transpose(self, *axes):
-        """Transpose dimensions"""
+        """Transpose dimensions with explicit axis ordering"""
         out_data = self.xp.transpose(self.data, axes)
         out = Tensor(out_data, device=self.device, dtype=self.dtype,
                     requires_grad=self.requires_grad)
-
         if self.requires_grad:
             out._prev = {self}
             def _backward():
                 self.grad.data += self.xp.transpose(out.grad.data, axes)
             out._backward = _backward
-
         return out
 
     def pad2d(self, padding):
@@ -774,6 +865,18 @@ class Tensor:
         tensors_unsqueezed = [Tensor.unsqueeze(t, axis) for t in tensors]
         return Tensor.concatenate(tensors_unsqueezed, axis=axis)
 
+    @classmethod
+    def randn(cls, *shape, device='cpu', dtype=np.float32):
+        xp = np if device == 'cpu' else cp
+        return cls(xp.random.randn(*shape).astype(dtype), 
+                device=device, dtype=dtype, requires_grad=True)
+
+    def copy(self):
+        return Tensor(self.data.copy(), 
+                    device=self.device,
+                    dtype=self.dtype,
+                    requires_grad=self.requires_grad)
+    
     # Operator overloads
     __radd__ = __add__
     __rmul__ = __mul__

@@ -71,6 +71,8 @@ class Dense(Base_Layer):
             # Force cast to layer's dtype
             if x.dtype != self.dtype:
                 x = x.astype(self.dtype)
+            if x.device != self.device:  # Add this check
+                x = x.to(self.device)
         return x @ self.weights + self.bias
 
     @property

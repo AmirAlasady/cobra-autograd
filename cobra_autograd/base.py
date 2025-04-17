@@ -21,7 +21,6 @@ class Base_Layer(ABC):
     def set_gpu(self):
         pass
 
-
     def set_cpu(self):
         pass
 

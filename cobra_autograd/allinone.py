@@ -82,6 +82,10 @@ class Tensor:
         )
     def __getitem__(self, indices):
         """Enable slicing/indexing of tensor data"""
+        if isinstance(indices, Tensor):
+            if indices.device != self.device:
+                indices = indices.to(self.device)
+            indices = indices.data
         out_data = self.data[indices]
         out = Tensor(out_data,
                     device=self.device,
@@ -395,9 +399,13 @@ class Tensor:
         return out
 
     def __mul__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(other, device=self.device,
-                    dtype=self.dtype,#remove this if needed
-                    )
+        
+        if isinstance(other, Tensor): 
+            other.device = self.device
+            other.dtype = self.dtype
+        else:
+            other=Tensor(other, device=self.device,dtype=self.dtype)
+
         assert self.device == other.device, "Devices must match"
 
         out_data = self.data * other.data
@@ -415,7 +423,8 @@ class Tensor:
                 other.grad.data += unbroadcast_grad(self.data * out.grad.data, other.shape, xp)
         out._backward = _backward
         return out
-
+    
+    """ old code
     def __matmul__(self, other):
         other = other if isinstance(other, Tensor) else Tensor(other, device=self.device,
                     dtype=self.dtype,#remove this if needed
@@ -423,6 +432,8 @@ class Tensor:
         assert self.device == other.device, "Devices must match"
 
         out_data = self.data @ other.data
+        #  ---- or use out_data = xp.matmul(self.data, other.data) for clearaty ----
+
         out = Tensor(out_data, device=self.device, requires_grad=(self.requires_grad or other.requires_grad),
                     dtype=self.dtype,#remove this if needed
                     )
@@ -437,7 +448,32 @@ class Tensor:
                 other.grad.data += xp.matmul(self.data.T, out.grad.data)
         out._backward = _backward
         return out
+    """
+    # new code with batch dimension
+    def __matmul__(self, other):
+        other = other if isinstance(other, Tensor) else Tensor(other, device=self.device, dtype=self.dtype)
+        assert self.device == other.device, "Devices must match"
 
+        out_data = self.data @ other.data
+        out = Tensor(out_data, device=self.device, requires_grad=(self.requires_grad or other.requires_grad),
+                    dtype=self.dtype)
+        out._prev = {self, other}
+        out._op = 'matmul'
+
+        def _backward():
+            xp = out.xp
+            # Handle batch dimensions by summing over batch axis
+            if self.requires_grad:
+                grad_self = xp.einsum('...ij,...kj->...ik', out.grad.data, other.data)
+                self.grad.data += grad_self.sum(axis=tuple(range(grad_self.ndim - 2)))
+                
+            if other.requires_grad:
+                grad_other = xp.einsum('...ki,...kj->...ij', self.data, out.grad.data)
+                other.grad.data += grad_other.sum(axis=tuple(range(grad_other.ndim - 2)))
+
+        out._backward = _backward
+        return out
+    
     def square(self):
         """Element-wise square operation"""
         return self ** 2  # Leverage existing __pow__ method
@@ -481,12 +517,69 @@ class Tensor:
 
       return out
 
-
+    """ old code
     def mean(self, axis=None):
         num_elements = np.prod(self.data.shape) if axis is None else self.data.shape[axis]
         denom = self.xp.array(num_elements, dtype=self.dtype)
         return self.sum(axis=axis) / float(denom)
+    """
+    def mean(self, axis=None, keepdims=False):
+        """Compute mean with axis support"""
+        out_data = self.xp.mean(self.data, axis=axis, keepdims=keepdims)
+        out = Tensor(out_data, 
+                    device=self.device,
+                    dtype=self.dtype,
+                    requires_grad=self.requires_grad)
 
+        if self.requires_grad:
+            out._prev = {self}
+            def _backward():
+                if axis is None:
+                    grad = self.xp.ones_like(self.data) * out.grad.data / self.data.size
+                else:
+                    if keepdims:
+                        grad = out.grad.data / self.data.shape[axis]
+                    else:
+                        grad = self.xp.expand_dims(out.grad.data, axis=axis) / self.data.shape[axis]
+                    grad = self.xp.broadcast_to(grad, self.data.shape)
+                self.grad.data += grad
+            out._backward = _backward
+            
+        return out
+# --
+    def var(self, axis=None, keepdims=False, unbiased=True):
+        """Compute variance with axis support"""
+        mean = self.mean(axis=axis, keepdims=True)
+        squared_diff = (self - mean).square()
+        ddof = 1 if unbiased else 0
+        if axis is None:
+            n = self.data.size
+        else:
+            n = self.data.shape[axis]
+        out_data = squared_diff.data.mean(axis=axis, keepdims=keepdims) * n / (n - ddof)
+        
+        out = Tensor(out_data,
+                    device=self.device,
+                    dtype=self.dtype,
+                    requires_grad=self.requires_grad)
+
+        if self.requires_grad:
+            out._prev = {self}
+            def _backward():
+                # Gradient of variance calculation
+                grad = (2 / (n - ddof)) * (self.data - mean.data) * out.grad.data
+                if axis is not None and not keepdims:
+                    grad = self.xp.expand_dims(grad, axis=axis)
+                grad = self.xp.broadcast_to(grad, self.data.shape)
+                self.grad.data += grad
+            out._backward = _backward
+            
+        return out
+# --
+    def sqrt(self):
+        """Element-wise square root"""
+        return self ** 0.5
+    
     def __truediv__(self, other):
         xp = self.xp
         eps_val = 1e-8 if self.dtype == np.float32 else 1e-16
@@ -686,17 +779,15 @@ class Tensor:
 
     ### conv ###
     def transpose(self, *axes):
-        """Transpose dimensions"""
+        """Transpose dimensions with explicit axis ordering"""
         out_data = self.xp.transpose(self.data, axes)
         out = Tensor(out_data, device=self.device, dtype=self.dtype,
                     requires_grad=self.requires_grad)
-
         if self.requires_grad:
             out._prev = {self}
             def _backward():
                 self.grad.data += self.xp.transpose(out.grad.data, axes)
             out._backward = _backward
-
         return out
 
     def pad2d(self, padding):
@@ -774,6 +865,18 @@ class Tensor:
         tensors_unsqueezed = [Tensor.unsqueeze(t, axis) for t in tensors]
         return Tensor.concatenate(tensors_unsqueezed, axis=axis)
 
+    @classmethod
+    def randn(cls, *shape, device='cpu', dtype=np.float32):
+        xp = np if device == 'cpu' else cp
+        return cls(xp.random.randn(*shape).astype(dtype), 
+                device=device, dtype=dtype, requires_grad=True)
+
+    def copy(self):
+        return Tensor(self.data.copy(), 
+                    device=self.device,
+                    dtype=self.dtype,
+                    requires_grad=self.requires_grad)
+    
     # Operator overloads
     __radd__ = __add__
     __rmul__ = __mul__
@@ -781,9 +884,7 @@ class Tensor:
     __sub__ = lambda self, other: self + (-other)
     __rtruediv__ = lambda self, other: Tensor(other) / self
 
-
 from abc import ABC, abstractmethod
-
 
 class Base_Layer(ABC):
     _id_counter = 0
@@ -805,7 +906,6 @@ class Base_Layer(ABC):
     def set_gpu(self):
         pass
 
-
     def set_cpu(self):
         pass
 
@@ -821,10 +921,11 @@ class Base_Layer(ABC):
     def load_state_dict(self, state_dict):
         pass
 
-
-
 import re
 import numpy as np
+
+from base import Base_Layer
+from tensor import Tensor
 
 def parse_dtype(dtype_str):
     """
@@ -893,6 +994,8 @@ class Dense(Base_Layer):
             # Force cast to layer's dtype
             if x.dtype != self.dtype:
                 x = x.astype(self.dtype)
+            if x.device != self.device:  # Add this check
+                x = x.to(self.device)
         return x @ self.weights + self.bias
 
     @property
@@ -924,126 +1027,13 @@ class Dense(Base_Layer):
         if self.bias.grad is not None:
             self.bias.grad.data.fill(0)  # Reset gradient in Tensor
 
-class Conv2D(Base_Layer):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, device='cpu', dtype=np.float32):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dtype = dtype
 
-        # Xavier initialization
-        scale = np.sqrt(2.0 / (in_channels * kernel_size * kernel_size))
-        self.kernels = Tensor(
-            np.random.randn(out_channels, in_channels, kernel_size, kernel_size).astype(dtype) * scale,
-            device=device, dtype=dtype, requires_grad=True
-        )
-        self.bias = Tensor(
-            np.zeros(out_channels, dtype=dtype),
-            device=device, dtype=dtype, requires_grad=True
-        )
-
-    def forward(self, x):
-        batch_size, in_channels, h_in, w_in = x.shape
-        h_out = (h_in + 2*self.padding - self.kernel_size) // self.stride + 1
-        w_out = (w_in + 2*self.padding - self.kernel_size) // self.stride + 1
-        xp = x.xp
-
-        # Pad input if needed
-        if self.padding > 0:
-            x = x.pad2d(self.padding)
-
-        # Extract windows using stride tricks
-        strides = (
-            x.data.strides[0],  # Batch
-            x.data.strides[1],  # Channels
-            self.stride * x.data.strides[2],  # Height
-            self.stride * x.data.strides[3],  # Width
-            x.data.strides[2],  # Kernel height
-            x.data.strides[3]   # Kernel width
-        )
-
-        windows = xp.lib.stride_tricks.as_strided(
-            x.data,
-            shape=(batch_size, self.in_channels, h_out, w_out, self.kernel_size, self.kernel_size),
-            strides=strides
-        )
-
-        # Reshape for batch matrix multiplication
-        x_col = windows.transpose(1, 4, 5, 0, 2, 3).reshape(
-            self.in_channels * self.kernel_size * self.kernel_size,
-            batch_size * h_out * w_out
-        )
-
-        # Reshape kernels for matrix multiplication
-        k_col = self.kernels.data.reshape(self.out_channels, -1)
-
-        # Matrix multiplication (most compute-intensive part)
-        out = (k_col @ x_col).reshape(
-            self.out_channels, batch_size, h_out, w_out
-        ).transpose(1, 0, 2, 3)
-
-        # Add bias
-        out += self.bias.data.reshape(1, self.out_channels, 1, 1)
-
-        return Tensor(out, device=x.device, dtype=self.dtype, requires_grad=x.requires_grad)
-
-    def state_dict(self):
-        return {"kernels": self.kernels.data.copy(), "bias": self.bias.data.copy(),
-                "config": {"in_channels": self.in_channels, "out_channels": self.out_channels,
-                           "kernel_size": self.kernel_size, "stride": self.stride, "padding": self.padding,
-                           "dtype": str(self.dtype)}}
-    def load_state_dict(self, state_dict):
-        self.kernels.data = state_dict["kernels"]
-        self.bias.data = state_dict["bias"]
-    def __call__(self, x):
-        """Explicit call interface (redundant but safe)"""
-        return self.forward(x)
-
-class MaxPool2D(Base_Layer):
-    def __init__(self, kernel_size=2, stride=2):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.stride = stride
-    def forward(self, x):
-        xp = x.xp
-        batch_size, channels, height, width = x.shape
-        h_out = (height - self.kernel_size) // self.stride + 1
-        w_out = (width - self.kernel_size) // self.stride + 1
-        windows = xp.lib.stride_tricks.as_strided(
-            x.data,
-            shape=(batch_size, channels, h_out, w_out, self.kernel_size, self.kernel_size),
-            strides=(x.data.strides[0], x.data.strides[1],
-                     self.stride*x.data.strides[2], self.stride*x.data.strides[3],
-                     x.data.strides[2], x.data.strides[3])
-        )
-        out_data = xp.max(windows, axis=(4,5))
-        out = Tensor(out_data, device=x.device, dtype=x.dtype, requires_grad=x.requires_grad)
-        # Save mask for backward (if needed)
-        self.mask = (windows == out_data[..., None, None])
-        return out
-    def state_dict(self):
-        return {"kernel_size": self.kernel_size, "stride": self.stride}
-    def load_state_dict(self, state_dict):
-        self.kernel_size = state_dict["kernel_size"]
-        self.stride = state_dict["stride"]
-
-class Flatten(Base_Layer):
-    def __init__(self):
-        super().__init__()
-        self.original_shape = None
-    def forward(self, x):
-        self.original_shape = x.shape
-        return x.reshape(x.shape[0], -1)
-    def state_dict(self):
-        return {}
-    def load_state_dict(self, state_dict):
-        pass
-
-
+# Ensure you import your Tensor class appropriately
+# from your_tensor_module import Tensor
 from abc import ABC, abstractmethod
+
+from base import Base_Layer
+from tensor import Tensor
 # Ensure you import your Tensor class appropriately
 # from your_tensor_module import Tensor
 
@@ -1193,6 +1183,10 @@ class ELU(Activation):
 
     def __call__(self, x):
         return self.forward(x)
+
+from tensor import Tensor
+
+
 class Sequential:
     def __init__(self, layers, device='cpu'):
         """
@@ -1261,96 +1255,138 @@ class Sequential:
         for i, layer in enumerate(self.layers):
             if hasattr(layer, 'load_state_dict'):
                 layer.load_state_dict(state_dict.get(f'layer_{i}', {}))
-class Loss:
-    """Base loss class with numerical stability safeguards"""
-    EPSILON = 1e-12
-
-    def __call__(self, pred: 'Tensor', target: 'Tensor') -> 'Tensor':
-        raise NotImplementedError
 
 
-class MSELoss(Loss):
-    """Mean Squared Error Loss with automatic broadcasting"""
-    def __call__(self, pred: 'Tensor', target: 'Tensor') -> 'Tensor':
-        """
-        Args:
-            pred: Prediction tensor of shape (batch_size, ...)
-            target: Target tensor of shape (batch_size, ...)
 
-        Returns:
-            MSE loss tensor with automatic broadcasting
-        """
-        return (pred - target).square().mean()
+import numpy as np
+from base import Base_Layer
+from tensor import Tensor
 
 
-class CrossEntropy(Loss):
-    def __call__(self, pred: Tensor, target: Tensor) -> Tensor:
-        # Numerically stable implementation
-        max_val = pred.max(axis=-1, keepdims=True)
-        stable_exp = (pred - max_val).exp()
-        softmax = stable_exp / stable_exp.sum(axis=-1, keepdims=True)  # Now works!
-        return -(target * softmax.log()).mean()
+class Conv2D(Base_Layer):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, device='cpu', dtype=np.float32):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dtype = dtype
+
+        # Xavier initialization
+        scale = np.sqrt(2.0 / (in_channels * kernel_size * kernel_size))
+        self.kernels = Tensor(
+            np.random.randn(out_channels, in_channels, kernel_size, kernel_size).astype(dtype) * scale,
+            device=device, dtype=dtype, requires_grad=True
+        )
+        self.bias = Tensor(
+            np.zeros(out_channels, dtype=dtype),
+            device=device, dtype=dtype, requires_grad=True
+        )
+
+    def forward(self, x):
+        batch_size, in_channels, h_in, w_in = x.shape
+        h_out = (h_in + 2*self.padding - self.kernel_size) // self.stride + 1
+        w_out = (w_in + 2*self.padding - self.kernel_size) // self.stride + 1
+        xp = x.xp
+
+        # Pad input if needed
+        if self.padding > 0:
+            x = x.pad2d(self.padding)
+
+        # Extract windows using stride tricks
+        strides = (
+            x.data.strides[0],  # Batch
+            x.data.strides[1],  # Channels
+            self.stride * x.data.strides[2],  # Height
+            self.stride * x.data.strides[3],  # Width
+            x.data.strides[2],  # Kernel height
+            x.data.strides[3]   # Kernel width
+        )
+
+        windows = xp.lib.stride_tricks.as_strided(
+            x.data,
+            shape=(batch_size, self.in_channels, h_out, w_out, self.kernel_size, self.kernel_size),
+            strides=strides
+        )
+
+        # Reshape for batch matrix multiplication
+        x_col = windows.transpose(1, 4, 5, 0, 2, 3).reshape(
+            self.in_channels * self.kernel_size * self.kernel_size,
+            batch_size * h_out * w_out
+        )
+
+        # Reshape kernels for matrix multiplication
+        k_col = self.kernels.data.reshape(self.out_channels, -1)
+
+        # Matrix multiplication (most compute-intensive part)
+        out = (k_col @ x_col).reshape(
+            self.out_channels, batch_size, h_out, w_out
+        ).transpose(1, 0, 2, 3)
+
+        # Add bias
+        out += self.bias.data.reshape(1, self.out_channels, 1, 1)
+
+        return Tensor(out, device=x.device, dtype=self.dtype, requires_grad=x.requires_grad)
+
+    def state_dict(self):
+        return {"kernels": self.kernels.data.copy(), "bias": self.bias.data.copy(),
+                "config": {"in_channels": self.in_channels, "out_channels": self.out_channels,
+                           "kernel_size": self.kernel_size, "stride": self.stride, "padding": self.padding,
+                           "dtype": str(self.dtype)}}
+    def load_state_dict(self, state_dict):
+        self.kernels.data = state_dict["kernels"]
+        self.bias.data = state_dict["bias"]
+    def __call__(self, x):
+        """Explicit call interface (redundant but safe)"""
+        return self.forward(x)
+
+class MaxPool2D(Base_Layer):
+    def __init__(self, kernel_size=2, stride=2):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+    def forward(self, x):
+        xp = x.xp
+        batch_size, channels, height, width = x.shape
+        h_out = (height - self.kernel_size) // self.stride + 1
+        w_out = (width - self.kernel_size) // self.stride + 1
+        windows = xp.lib.stride_tricks.as_strided(
+            x.data,
+            shape=(batch_size, channels, h_out, w_out, self.kernel_size, self.kernel_size),
+            strides=(x.data.strides[0], x.data.strides[1],
+                     self.stride*x.data.strides[2], self.stride*x.data.strides[3],
+                     x.data.strides[2], x.data.strides[3])
+        )
+        out_data = xp.max(windows, axis=(4,5))
+        out = Tensor(out_data, device=x.device, dtype=x.dtype, requires_grad=x.requires_grad)
+        # Save mask for backward (if needed)
+        self.mask = (windows == out_data[..., None, None])
+        return out
+    def state_dict(self):
+        return {"kernel_size": self.kernel_size, "stride": self.stride}
+    def load_state_dict(self, state_dict):
+        self.kernel_size = state_dict["kernel_size"]
+        self.stride = state_dict["stride"]
+
+class Flatten(Base_Layer):
+    def __init__(self):
+        super().__init__()
+        self.original_shape = None
+    def forward(self, x):
+        self.original_shape = x.shape
+        return x.reshape(x.shape[0], -1)
+    def state_dict(self):
+        return {}
+    def load_state_dict(self, state_dict):
+        pass
 
 
-class SoftmaxCrossEntropyLoss(Loss):
-    def __call__(self, pred: 'Tensor', target: 'Tensor') -> 'Tensor':
-        # Convert class indices to int64
-        if target.ndim > 1 and target.shape[-1] > 1:
-            class_indices = target.argmax(axis=-1).astype(np.int64)
-        else:
-            class_indices = target.astype(np.int64)  # Add explicit cast
-
-        # Numerical stability implementation
-        max_pred = pred.max(axis=-1, keepdims=True)
-        log_sum_exp = (pred - max_pred).exp().sum(axis=-1, keepdims=True).log()
-        log_softmax = pred - max_pred - log_sum_exp
-
-        # Reshape indices for gather
-        class_indices = class_indices.reshape(-1, 1)
-
-        # Gather needs matching dimensions
-        nll_loss = -log_softmax.gather(1, class_indices)
-        return nll_loss.mean()
-
-
-class BCELoss(Loss):
-    def __call__(self, pred: Tensor, target: Tensor) -> Tensor:
-        """Binary Cross Entropy with proper Tensor operations"""
-        ones = Tensor(1.0)
-        epsilon = Tensor(1e-7)
-
-        # Clip using Tensor instances
-        clipped = pred.clip(epsilon, ones - epsilon)
-        return -(target * clipped.log() + (ones - target) * (ones - clipped).log()).mean()
-
-
-class Accuracy:
-    """Flexible accuracy metric supporting multiple formats"""
-    def __call__(self, pred: 'Tensor', target: 'Tensor') -> float:
-        """
-        Args:
-            pred: (batch_size, num_classes) logits/probabilities
-            target: (batch_size,) class indices or (batch_size, num_classes) one-hot
-
-        Returns:
-            Accuracy score between 0 and 1
-        """
-        # Get prediction classes
-        pred_classes = pred.argmax(axis=-1).data
-
-        # Handle different target formats
-        if target.ndim > 1 and target.shape[-1] > 1:
-            # One-hot encoded targets
-            target_classes = target.argmax(axis=-1).data
-        else:
-            # Class indices
-            target_classes = target.data.squeeze()
-
-        # Device-aware comparison
-        if isinstance(pred_classes, np.ndarray):
-            return np.mean(pred_classes == target_classes)
-        else:  # cupy
-            return float(cp.mean(pred_classes == target_classes))
+import numpy as np
+try:
+    import cupy as cp # type: ignore
+except ImportError:
+    cp = None
 
 class Optimizer:
     """Base optimizer class with learning rate decay"""
@@ -1370,7 +1406,7 @@ class Optimizer:
 
     def _get_xp(self, param):
         """Get correct numerical library for parameter"""
-        return np if param.device == 'cpu' else cp
+        return np if param.device == 'cpu' else cp # type: ignore
 
     def step(self):
         """Update parameters (to be implemented by subclasses)"""
@@ -1426,100 +1462,719 @@ class Adam(Optimizer):
 
             # Update parameters
             param.data -= self.lr * m_hat / (xp.sqrt(v_hat) + self.epsilon)
-class BaseModel(Base_Layer):
+
+
+
+import numpy as np
+from tensor import Tensor
+try:
+    import cupy as cp # type: ignore
+except ImportError:
+    cp = None
+
+
+class Loss:
+    """Base loss class with numerical stability safeguards"""
+    EPSILON = 1e-12
+
+    def __call__(self, pred: 'Tensor', target: 'Tensor') -> 'Tensor':
+        raise NotImplementedError
+
+
+class MSELoss(Loss):
+    """Mean Squared Error Loss with automatic broadcasting"""
+    def __call__(self, pred: 'Tensor', target: 'Tensor') -> 'Tensor':
+        """
+        Args:
+            pred: Prediction tensor of shape (batch_size, ...)
+            target: Target tensor of shape (batch_size, ...)
+
+        Returns:
+            MSE loss tensor with automatic broadcasting
+        """
+        return (pred - target).square().mean()
+
+
+class CrossEntropy(Loss):
+    def __call__(self, pred: Tensor, target: Tensor) -> Tensor:
+        # Numerically stable implementation
+        max_val = pred.max(axis=-1, keepdims=True)
+        stable_exp = (pred - max_val).exp()
+        softmax = stable_exp / stable_exp.sum(axis=-1, keepdims=True)  # Now works!
+        return -(target * softmax.log()).mean()
+
+
+
+class SoftmaxCrossEntropyLoss(Loss):
+    def __call__(self, pred: 'Tensor', target: 'Tensor') -> 'Tensor':
+        # If target has the same number of dimensions as pred,
+        # assume it's one-hot encoded; otherwise, assume it's indices.
+        if target.ndim == pred.ndim:
+            class_indices = target.argmax(axis=-1).astype(np.int64)
+        else:
+            class_indices = target.astype(np.int64)
+
+        # Numerical stability: compute log-softmax
+        max_pred = pred.max(axis=-1, keepdims=True)
+        log_sum_exp = (pred - max_pred).exp().sum(axis=-1, keepdims=True).log()
+        log_softmax = pred - max_pred - log_sum_exp
+
+        # Flatten log_softmax from shape (batch, seq_len, vocab_size) to (batch * seq_len, vocab_size)
+        log_softmax_flat = log_softmax.reshape(-1, log_softmax.shape[-1])
+        
+        # Flatten class indices from shape (batch, seq_len) to (batch * seq_len, 1)
+        class_indices = class_indices.reshape(-1, 1)
+
+        # Gather the log probabilities for the correct classes along axis 1
+        nll_loss = -log_softmax_flat.gather(1, class_indices)
+        return nll_loss.mean()
+
+
+class BCELoss(Loss):
+    def __call__(self, pred: Tensor, target: Tensor) -> Tensor:
+        """Binary Cross Entropy with proper Tensor operations"""
+        ones = Tensor(1.0)
+        epsilon = Tensor(1e-7)
+
+        # Clip using Tensor instances
+        clipped = pred.clip(epsilon, ones - epsilon)
+        return -(target * clipped.log() + (ones - target) * (ones - clipped).log()).mean()
+
+
+class Accuracy:
+    """Flexible accuracy metric supporting multiple formats"""
+    def __call__(self, pred: 'Tensor', target: 'Tensor') -> float:
+        """
+        Args:
+            pred: (batch_size, num_classes) logits/probabilities
+            target: (batch_size,) class indices or (batch_size, num_classes) one-hot
+
+        Returns:
+            Accuracy score between 0 and 1
+        """
+        # Get prediction classes
+        pred_classes = pred.argmax(axis=-1).data
+
+        # Handle different target formats
+        if target.ndim > 1 and target.shape[-1] > 1:
+            # One-hot encoded targets
+            target_classes = target.argmax(axis=-1).data
+        else:
+            # Class indices
+            target_classes = target.data.squeeze()
+
+        # Device-aware comparison
+        if isinstance(pred_classes, np.ndarray):
+            return np.mean(pred_classes == target_classes)
+        else:  # cupy
+            return float(cp.mean(pred_classes == target_classes))
+        
+import numpy as np
+try:
+    import cupy as cp # type: ignore
+except ImportError:
+    cp = None
+
+class Optimizer:
+    """Base optimizer class with learning rate decay"""
+    def __init__(self, params, lr=0.01, decay=0.0):
+        """
+        Args:
+            params: List of trainable parameters (Tensors)
+            lr: Initial learning rate
+            decay: Learning rate decay factor (per epoch)
+        """
+        self.params = [p for p in params if p.requires_grad]
+        self.lr = lr
+        self.initial_lr = lr
+        self.decay = decay
+        self.iterations = 0
+        self.xp = np  # Default to numpy
+
+    def _get_xp(self, param):
+        """Get correct numerical library for parameter"""
+        return np if param.device == 'cpu' else cp # type: ignore
+
+    def step(self):
+        """Update parameters (to be implemented by subclasses)"""
+        raise NotImplementedError
+
+    def decay_lr(self):
+        """Exponential learning rate decay"""
+        self.lr *= (1.0 - self.decay)
+
+class SGD(Optimizer):
+    """Momentum SGD with learning rate decay"""
+    def __init__(self, params, lr=0.01, momentum=0.9, decay=0.0):
+        super().__init__(params, lr, decay)
+        self.momentum = momentum
+        self.velocities = [self._get_xp(p).zeros_like(p.data) for p in self.params]
+
+    def step(self):
+        self.iterations += 1
+        for i, param in enumerate(self.params):
+            xp = self._get_xp(param)
+
+            # Update velocity
+            self.velocities[i] = self.momentum * self.velocities[i] + \
+                                (1 - self.momentum) * param.grad.data
+
+            # Update parameters
+            param.data -= self.lr * self.velocities[i]
+
+class Adam(Optimizer):
+    """Adam optimizer with learning rate decay"""
+    def __init__(self, params, lr=0.001, beta1=0.9, beta2=0.999,
+                 epsilon=1e-8, decay=0.0):
+        super().__init__(params, lr, decay)
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.m = [self._get_xp(p).zeros_like(p.data) for p in self.params]
+        self.v = [self._get_xp(p).zeros_like(p.data) for p in self.params]
+        self.t = 0
+
+    def step(self):
+        self.t += 1
+        for i, param in enumerate(self.params):
+            xp = self._get_xp(param)
+
+            # Update first and second moment estimates
+            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * param.grad.data
+            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * xp.square(param.grad.data)
+
+            # Bias-corrected estimates
+            m_hat = self.m[i] / (1 - self.beta1 ** self.t)
+            v_hat = self.v[i] / (1 - self.beta2 ** self.t)
+
+            # Update parameters
+            param.data -= self.lr * m_hat / (xp.sqrt(v_hat) + self.epsilon)
+
+
+class BaseModel:
     def __init__(self):
-        super().__init__()
+        """Initialize BaseModel with empty modules dictionary."""
         self._modules = {}  # Tracks all child components
         self.device = 'cpu'
         self.dtype = np.float32  # Default dtype
 
     def __setattr__(self, name, value):
-        """Auto-register layers/modules when assigned as attributes"""
+        """
+        Auto-register layers/modules AND parameters when assigned as attributes.
+        Fixed to handle framework's specific classes.
+        """
+        # First register appropriate elements in _modules
         if not name.startswith('_'):
-            if isinstance(value, (Base_Layer, Sequential)) or \
-               (hasattr(value, 'parameters') and hasattr(value, 'forward')):
+            # Register specific types that framework uses
+            if (isinstance(value, (Base_Layer, BaseModel, Sequential, Conv2D)) or 
+                (isinstance(value, Tensor) and hasattr(value, 'requires_grad'))):
+                
+                # Ensure _modules exists
                 if not hasattr(self, '_modules'):
                     self._modules = {}
+                    
+                # Register in _modules dictionary
                 self._modules[name] = value
+        
+        # Always set the attribute using parent method
         super().__setattr__(name, value)
 
     @property
     def parameters(self):
-        """Collect all trainable parameters across all submodules"""
+        """
+        Collect all trainable parameters across all submodules.
+        Handles framework's parameter collection logic.
+        """
         params = []
         for module in self._modules.values():
+            # For modules with their own parameters property/method
             if hasattr(module, 'parameters'):
-                params += module.parameters
-            elif isinstance(module, Tensor):
+                if callable(getattr(module, 'parameters')) and not isinstance(module.parameters, property):
+                    # It's a method - call it
+                    params.extend(module.parameters())
+                else:
+                    # It's a property - access it directly
+                    params.extend(module.parameters)
+            # For direct Tensor parameters
+            elif isinstance(module, Tensor) and module.requires_grad:
                 params.append(module)
         return params
 
     def forward(self, inputs):
-        """Default forward pass through registered modules in assignment order"""
+        """
+        Default forward pass through registered modules in assignment order.
+        Simple sequential processing.
+        """
         x = inputs
         for name, module in self._modules.items():
-            x = module(x)
+            if hasattr(module, '__call__'):
+                x = module(x)
         return x
 
     def set_device(self, device):
-        """Propagate device setting to all subcomponents"""
+        """
+        Propagate device setting to all subcomponents.
+        Fixed to handle device migration in your framework.
+        """
         self.device = device
-        for module in self._modules.values():
-            if hasattr(module, 'set_device'):
+        
+        # Update each registered module
+        for name in list(self._modules.keys()):
+            module = self._modules[name]
+            
+            # Handle direct Tensor attributes
+            if isinstance(module, Tensor):
+                moved = module.to(device)
+                self._modules[name] = moved
+                setattr(self, name, moved)
+            # Handle modules with set_device method
+            elif hasattr(module, 'set_device'):
                 module.set_device(device)
+            # Handle other modules with device attribute
             elif hasattr(module, 'device'):
                 module.device = device
-            if isinstance(module, Tensor):
-                module.to(device)
+                # Update parameters in layers like Dense
+                if hasattr(module, 'parameters'):
+                    # Try common parameter names
+                    for param_name in ['weights', 'bias']:
+                        if hasattr(module, param_name):
+                            param = getattr(module, param_name)
+                            if hasattr(param, 'to'):
+                                moved_param = param.to(device)
+                                setattr(module, param_name, moved_param)
 
     def set_dtype(self, dtype):
-        """Cast all parameters to specified dtype"""
+        """
+        Cast all parameters to specified dtype.
+        Fixed to work with tensor data rather than the tensor objects.
+        """
+        # Store dtype in model
         self.dtype = dtype
+        
+        # Cast tensor data in parameters
         for param in self.parameters:
-            if hasattr(param, 'astype'):
+            if hasattr(param, 'data') and hasattr(param.data, 'astype'):
                 param.data = param.data.astype(dtype)
 
     def state_dict(self):
-        """Aggregate state dicts from all submodules"""
+        """
+        Aggregate state dicts from all submodules.
+        Fixed to properly handle tensor data.
+        """
         state = {
             '_meta': {
                 'device': self.device,
                 'dtype': str(self.dtype)
             }
         }
+        
+        # Process each module
         for name, module in self._modules.items():
-            if hasattr(module, 'state_dict'):
+            if hasattr(module, 'state_dict') and callable(module.state_dict):
+                # Handle modules with their own state_dict
                 state[name] = module.state_dict()
-            elif isinstance(module, Tensor):
+            elif isinstance(module, Tensor) and hasattr(module, 'data'):
+                # Handle direct tensor data
                 state[name] = module.data.copy()
+        
         return state
 
     def load_state_dict(self, state_dict):
-        """Load state dicts into appropriate submodules"""
-        meta = state_dict.pop('_meta', {})
-        self.set_device(meta.get('device', 'cpu'))
-        self.set_dtype(parse_dtype(meta.get('dtype', np.float32)))
-
+        """
+        Load state dicts into appropriate submodules.
+        Fixed for framework's parameter handling.
+        """
+        # Extract meta info if available
+        if '_meta' in state_dict:
+            meta = state_dict.pop('_meta')
+            target_device = meta.get('device', 'cpu')
+            
+            # Handle dtype parsing safely
+            if 'dtype' in meta:
+                try:
+                    target_dtype = parse_dtype(meta.get('dtype'))
+                    self.dtype = target_dtype
+                except Exception:
+                    # Fall back to default
+                    pass
+                
+            # Set device globally first
+            self.device = target_device
+        
+        # Load each module's state
         for name, data in state_dict.items():
-            module = getattr(self, name)
-            if hasattr(module, 'load_state_dict'):
-                module.load_state_dict(data)
-            elif isinstance(module, Tensor):
-                module.data = data
+            if hasattr(self, name):
+                module = getattr(self, name)
+                
+                if hasattr(module, 'load_state_dict') and callable(module.load_state_dict):
+                    # Handle modules with load_state_dict method
+                    module.load_state_dict(data)
+                elif isinstance(module, Tensor) and hasattr(module, 'data'):
+                    # Handle direct tensors
+                    module.data = data
+                    
+                    # Ensure correct device
+                    if hasattr(module, 'device') and module.device != self.device:
+                        setattr(self, name, module.to(self.device))
+        
+        # Apply dtype update
+        self.set_dtype(self.dtype)
 
     def zero_grad(self):
-        """Clear gradients from all parameters"""
+        """Clear gradients from all parameters."""
         for param in self.parameters:
-            param.zero_grad()
+            if hasattr(param, 'zero_grad'):
+                param.zero_grad()
+
     def no_grad(self):
-        """Convenience method to access Tensor's no_grad context"""
+        """Convenience method to access Tensor's no_grad context."""
         return Tensor.no_grad()
 
-
     def __call__(self, inputs):
+        """Enable direct calling of model instances."""
         return self.forward(inputs)
 
     def __repr__(self):
+        """Pretty string representation of the model structure."""
         return f"{self.__class__.__name__}(\n" + \
                "\n".join(f"  ({name}): {module}"
                         for name, module in self._modules.items()) + "\n)"
+
+
+
+
+class Embedding(BaseModel):
+    def __init__(self, vocab_size, d_model, dtype=np.float32):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.dtype = dtype
+        # Xavier initialization using parent's device/dtype
+        init_std = np.sqrt(2.0 / (vocab_size + d_model))
+        weight_data = np.random.randn(vocab_size, d_model).astype(self.dtype) * init_std
+        
+        self.weight = Tensor(weight_data, 
+                           device=self.device,  # Use BaseModel's device
+                           dtype=self.dtype,
+                           requires_grad=True)
+
+    def forward(self, x):
+        # Ensure input is Tensor and on correct device
+        if not isinstance(x, Tensor):
+            x = Tensor(x, device=self.device, dtype=np.int64)
+        else:
+            x = x.to(self.device).astype(np.int64)  # Force device/dtype
+        return self.weight[x]
+    
+
+
+class PositionalEncoding(BaseModel):
+    def __init__(self, d_model: int, max_seq_len: int = 5000, dtype=np.float32):
+        super().__init__()
+        self.d_model = d_model
+        self.max_seq_len = max_seq_len
+        self.pos_enc = self._create_positional_encoding()
+        self.dtype = dtype
+
+    def _create_positional_encoding(self):
+        position = np.arange(self.max_seq_len)[:, np.newaxis]
+        div_term = np.exp(-(np.arange(0, self.d_model, 2) * np.log(10000.0) / self.d_model))
+        
+        pos_enc = np.zeros((self.max_seq_len, self.d_model), dtype=self.dtype)
+        pos_enc[:, 0::2] = np.sin(position * div_term)
+        pos_enc[:, 1::2] = np.cos(position * div_term)
+        
+        return Tensor(pos_enc, 
+                     device=self.device,
+                     requires_grad=False,
+                     dtype=self.dtype)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Get proper numerical library
+        xp = x.xp
+        
+        # Get positional encoding for sequence length
+        seq_len = x.shape[1]
+        pos_enc = self.pos_enc[:seq_len]
+        
+        # Reshape positional encoding for broadcasting
+        # From (seq_len, d_model) to (1, seq_len, d_model)
+        pos_enc = pos_enc.reshape(1, seq_len, self.d_model)
+        
+        # Expand to match batch dimension
+        # Result shape: (batch_size, seq_len, d_model)
+        pos_enc = xp.broadcast_to(pos_enc.data, (x.shape[0], seq_len, self.d_model))
+        
+        return x + Tensor(pos_enc, device=self.device, dtype=self.dtype)
+
+class MultiHeadAttention(BaseModel):
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1, dtype=np.float32):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.dropout = dropout
+        self.dtype = dtype
+        # All layers inherit device/dtype from parent
+        self.Wq = Dense(d_model, d_model,dtype=self.dtype)
+        self.Wk = Dense(d_model, d_model,dtype=self.dtype)
+        self.Wv = Dense(d_model, d_model,dtype=self.dtype)
+        self.Wo = Dense(d_model, d_model,dtype=self.dtype)
+
+    def __call__(self, query: Tensor, key: Tensor, value: Tensor, mask: Tensor = None) -> Tensor:
+        return self.forward(query, key, value, mask)
+
+    def split_heads(self, x: Tensor) -> Tensor:
+        batch_size, seq_len = x.shape[0], x.shape[1]
+        return x.reshape(batch_size, seq_len, self.num_heads, self.head_dim)\
+               .transpose(0, 2, 1, 3)
+
+    def combine_heads(self, x: Tensor) -> Tensor:
+        return x.transpose(0, 2, 1, 3)\
+               .reshape(x.shape[0], -1, self.d_model)
+
+    def scaled_dot_product_attention(self, q: Tensor, k: Tensor, v: Tensor, mask: Tensor = None):
+        attn_scores = (q @ k.transpose(0, 1, 3, 2)) / np.sqrt(self.head_dim)
+        if mask is not None:
+            attn_scores = attn_scores.where(mask, -1e9)
+        attn_weights = Softmax(axis=-1)(attn_scores)
+        return attn_weights @ v
+
+    def forward(self, query: Tensor, key: Tensor, value: Tensor, mask: Tensor = None):
+        q = self.split_heads(self.Wq(query))
+        k = self.split_heads(self.Wk(key))
+        v = self.split_heads(self.Wv(value))
+        attn_output = self.scaled_dot_product_attention(q, k, v, mask)
+        return self.Wo(self.combine_heads(attn_output))
+
+
+
+class LayerNorm(BaseModel):
+    def __init__(self, features: int, eps: float = 1e-5, dtype=np.float32):
+        """
+        Layer Normalization
+        
+        Args:
+            features: Size of the input feature dimension
+            eps: Small value to prevent division by zero
+            dtype: Data type for parameters
+        """
+        super().__init__()
+        self.features = features
+        self.eps = eps
+        self.dtype = dtype
+
+        # Learnable parameters
+        self.gamma = Tensor(np.ones(features), 
+                           dtype=dtype,
+                           requires_grad=True)
+        self.beta = Tensor(np.zeros(features),
+                          dtype=dtype,
+                          requires_grad=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Ensure input is on correct device
+        x = x.to(self.device).astype(self.dtype)
+        
+        # Calculate statistics
+        mean = x.mean(axis=-1, keepdims=True)
+        var = x.var(axis=-1, keepdims=True, unbiased=False)  # Use biased variance
+        
+        # Normalize
+        x_normalized = (x - mean) / (var + self.eps).sqrt()
+        #print('====================>')
+        #print(self.gamma.dtype)
+        #print(self.gamma.device)
+        #print(x_normalized.dtype)
+        #print(x_normalized.device)
+        # Scale and shift
+        return self.gamma * x_normalized + self.beta
+
+    @property
+    def parameters(self):
+        """Return gamma and beta for optimization"""
+        return [self.gamma, self.beta]
+
+    def state_dict(self):
+        return {
+            "gamma": self.gamma.data.copy(),
+            "beta": self.beta.data.copy(),
+            "features": self.features,
+            "eps": self.eps,
+            "device": self.device
+        }
+
+    def load_state_dict(self, state_dict):
+        self.gamma.data = state_dict['gamma']
+        self.beta.data = state_dict['beta']
+        self.features = state_dict.get('features', self.features)
+        self.eps = state_dict.get('eps', self.eps)
+
+
+class Encoder(BaseModel):
+    def __init__(self, vocab_size, d_model, num_heads, dtype=np.float32):
+        super().__init__()
+        self.dtype = dtype
+        self.embeddings = Embedding(vocab_size, d_model, dtype=self.dtype)
+        self.positional = PositionalEncoding(d_model, dtype=self.dtype)
+        self.attention = MultiHeadAttention(d_model, num_heads, dtype=self.dtype)
+        self.norm1 = LayerNorm(d_model, dtype=self.dtype)
+        self.norm2 = LayerNorm(d_model, dtype=self.dtype)
+        self.feedforward = Sequential([
+            Dense(d_model, d_model * 4, dtype=self.dtype),
+            ReLU(),
+            Dense(d_model * 4, d_model, dtype=self.dtype)])
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Embeddings and positional encoding
+        x = self.embeddings(x)
+        x = self.positional(x)
+        
+        # Attention block
+        residual = x
+        x = self.attention(x, x, x)
+        x = residual + x
+        x = self.norm1(x)
+        
+        # Feedforward block
+        residual = x
+        x = self.feedforward(x)
+        x = residual + x
+        x = self.norm2(x)
+        
+        return x
+    
+
+
+class Decoder(BaseModel):
+    def __init__(self, vocab_size, d_model, num_heads, dtype=np.float32):
+        super().__init__()
+        self.dtype = dtype
+        self.embeddings = Embedding(vocab_size, d_model, dtype=self.dtype)
+        self.positional = PositionalEncoding(d_model, dtype=self.dtype)
+        
+        # Self attention with masking
+        self.self_attention = MultiHeadAttention(d_model, num_heads, dtype=self.dtype)
+        self.norm1 = LayerNorm(d_model, dtype=self.dtype)
+        
+        # Encoder-Decoder attention
+        self.cross_attention = MultiHeadAttention(d_model, num_heads, dtype=self.dtype)
+        self.norm2 = LayerNorm(d_model, dtype=self.dtype)
+        
+        # Feedforward network
+        self.feedforward = Sequential([
+            Dense(d_model, d_model * 4, dtype=self.dtype),
+            ReLU(),
+            Dense(d_model * 4, d_model, dtype=self.dtype)
+        ])
+        self.norm3 = LayerNorm(d_model, dtype=self.dtype)
+
+    def create_causal_mask(self, seq_len):
+        """Create mask to prevent looking at future positions"""
+        xp = np if self.device == 'cpu' else cp
+        mask = xp.ones((1, seq_len, seq_len), dtype=self.dtype)
+        mask = xp.tril(mask)  # Lower triangular matrix
+        return Tensor(mask, device=self.device, requires_grad=False)
+
+    def __call__(self, target: Tensor, encoder_output: Tensor) -> Tensor:
+        return self.forward(target, encoder_output)
+
+    def forward(self, target: Tensor, encoder_output: Tensor) -> Tensor:
+        # Embed target sequence
+        x = self.embeddings(target)
+        x = self.positional(x)
+        
+        # Self attention with causal masking
+        residual = x
+        seq_len = x.shape[1]
+        mask = self.create_causal_mask(seq_len)
+        x = self.self_attention(x, x, x, mask)
+        x = residual + x
+        x = self.norm1(x)
+        
+        # Encoder-decoder attention
+        residual = x
+        x = self.cross_attention(x, encoder_output, encoder_output)
+        x = residual + x
+        x = self.norm2(x)
+        
+        # Feedforward block
+        residual = x
+        x = self.feedforward(x)
+        x = residual + x
+        x = self.norm3(x)
+        
+        return x
+
+
+
+
+class Transformer(BaseModel):
+    def __init__(self, src_vocab_size, tgt_vocab_size, d_model, num_heads, dtype=np.float32):
+        """
+        A full Transformer model that combines an Encoder, a Decoder, and a final projection layer.
+        
+        Args:
+            src_vocab_size (int): Vocabulary size for the encoder (source language).
+            tgt_vocab_size (int): Vocabulary size for the decoder (target language).
+            d_model (int): Dimensionality of the model.
+            num_heads (int): Number of attention heads.
+            dtype: Data type for computations.
+        """
+        super().__init__()
+        self.dtype = dtype
+
+        # Build the encoder and decoder blocks (each includes embeddings and positional encoding)
+        self.encoder = Encoder(src_vocab_size, d_model, num_heads, dtype=dtype)
+        self.decoder = Decoder(tgt_vocab_size, d_model, num_heads, dtype=dtype)
+        
+        # Final linear layer to map decoder output to target vocabulary logits
+        self.final_linear = Dense(d_model, tgt_vocab_size, dtype=dtype)
+
+    def forward(self, src: Tensor, tgt: Tensor) -> Tensor:
+        """
+        Forward pass of the Transformer.
+        
+        Args:
+            src (Tensor): Input tensor of shape (batch_size, src_seq_len) containing token indices.
+            tgt (Tensor): Target tensor of shape (batch_size, tgt_seq_len) containing token indices.
+            
+        Returns:
+            Tensor: Logits of shape (batch_size, tgt_seq_len, tgt_vocab_size)
+        """
+        # Pass source tokens through the encoder to get a continuous representation.
+        encoder_output = self.encoder(src)
+        
+        # Pass target tokens and the encoder output through the decoder.
+        decoder_output = self.decoder(tgt, encoder_output)
+        
+        # Project the decoder output into the target vocabulary space.
+        logits = self.final_linear(decoder_output)
+        return logits
+
+    def __call__(self, src: Tensor, tgt: Tensor) -> Tensor:
+        return self.forward(src, tgt)
+
+
+# functions for saving and loading state dictionaries as .pkl
+
+import pickle
+
+
+# saving function 
+def save_model_parameters(object_to_save, file_path):
+    print('<===== Saving =====>')
+    state_dict = object_to_save.state_dict()
+    with open(file_path, 'wb') as f:
+        pickle.dump(state_dict, f)
+        print('<===== Done =====>')
+        
+# loading function
+def load_state_dict_from_file(file_path):
+    with open(file_path, 'rb') as f:
+        state_dict = pickle.load(f)
+    return state_dict
+
+
