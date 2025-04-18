@@ -45,20 +45,22 @@
 
 Before installing the required Python packages, please ensure your system meets the following prerequisites:
 
-1.  **NVIDIA CUDA Toolkit 12.x Installation:**
+
+1.  **Python 3.12.x Installation:**
+    *   **Reason:** The project environment and its dependencies (including `numpy==1.26.4`, which is compatible with Python 3.12) are specified to work and for cuda support with **Python version 3.12.x** (e.g., 3.12.0, 3.12.1, 3.12.2, etc.). Using other Python versions (like 3.11 or 3.13) may lead to compatibility issues.
+    *   **Action:** Ensure you have a Python 3.12.x interpreter installed and are using it for this project (e.g., in your virtual environment).
+    *   **Verification:** You can check your active Python version by running `python --version` or `python3 --version` in your terminal.
+
+2.  **NVIDIA CUDA Toolkit 12.x Installation: optional but recommended for gpu support **
     *   **Reason:** The project depends on `cupy-cuda12x==13.3.0`. The `cuda12x` suffix indicates that this version of CuPy is specifically built for and requires **CUDA Toolkit version 12.x** (e.g., 12.0, 12.1, 12.2, 12.3, 12.4).
     *   **Action:** You must have a compatible NVIDIA driver and the CUDA Toolkit 12.x installed on your system.
     *   **Verification:** You can typically check your installed CUDA version by running `nvcc --version` in your terminal (if `nvcc` is in your PATH).
 
-2.  **Python 3.12.x Installation:**
-    *   **Reason:** The project environment and its dependencies (including `numpy==1.26.4`, which is compatible with Python 3.12) are specified to work with **Python version 3.12.x** (e.g., 3.12.0, 3.12.1, 3.12.2, etc.). Using other Python versions (like 3.11 or 3.13) may lead to compatibility issues.
-    *   **Action:** Ensure you have a Python 3.12.x interpreter installed and are using it for this project (e.g., in your virtual environment).
-    *   **Verification:** You can check your active Python version by running `python --version` or `python3 --version` in your terminal.
-
 **Summary of Dependencies Driving Requirements:**
 
-*   `cupy-cuda12x==13.3.0` -> Requires CUDA 12.x
+
 *   Project Configuration (implicit) & `numpy==1.26.4` (compatible) -> Requires Python 3.12.x
+*   `cupy-cuda12x==13.3.0` -> Requires CUDA 12.x
 
 Please install or configure CUDA and Python according to these requirements before proceeding with the package installation steps (e.g., `pip install -r requirements.txt`).
 
