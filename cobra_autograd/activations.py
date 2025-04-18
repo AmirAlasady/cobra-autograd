@@ -117,9 +117,9 @@ class LeakyReLU(Activation):
         if not isinstance(inputs, Tensor):
             inputs = Tensor(inputs, device=self.device)
         xp = inputs.xp  # Get numpy/cupy from the Tensor
-        condition = inputs > 0
-        # Use xp.expm1 for numerical stability
-        return inputs.where(condition, self.alpha * xp.expm1(inputs.data))
+        condition = inputs.data > 0
+        # Fixed implementation: alpha * x for negative values
+        return inputs.where(condition, self.alpha * inputs)
 
     def state_dict(self):
         return {"activation": type(self).__name__, "alpha": self.alpha}
